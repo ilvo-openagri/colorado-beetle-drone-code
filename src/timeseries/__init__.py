@@ -90,6 +90,17 @@ class TimeseriesDbConnector:
         if self._process is None:
             raise RuntimeError("Data logger process is not running.")
         self._timeseries_queue.put(data)
+        
+    def __len__(self) -> int:
+        """
+        Returns the number of items in the queue.
+
+        This method returns the current size of the queue.
+
+        Returns:
+            int: The number of items in the queue.
+        """
+        return self._timeseries_queue.qsize()
 
     @staticmethod
     def _data_logger(

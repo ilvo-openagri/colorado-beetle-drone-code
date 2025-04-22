@@ -84,7 +84,7 @@ class MinioController:
                         logger.error(f"Invalid data type: {type(sample)}")
                         continue
 
-                    logger.info(
+                    logger.debug(
                         "Uploading %s to bucket %s @ %s",
                         sample.source,
                         sample.bucket,
@@ -99,11 +99,11 @@ class MinioController:
                     if sample.delete:
                         try:
                             os.remove(sample.source)
-                            logger.info("Deleted source file: %s", sample.source)
+                            logger.debug("Deleted source file: %s", sample.source)
                         except OSError as e:
                             logger.error("Error deleting file %s: %s", sample.source, e)
 
-                    logger.info(
+                    logger.debug(
                         "Uploaded %s to bucket %s", sample.source, sample.bucket
                     )
                 except KeyboardInterrupt:
@@ -162,6 +162,15 @@ class MinioController:
                 source=file_path, name=object_name, bucket=bucket_name, delete=delete
             )
         )
+        
+    def __len__(self) -> int:
+        """
+        Returns the number of items in the MinIO queue.
+
+        Returns:
+            int: The number of items in the MinIO queue.
+        """
+        return self._minio_queue.qsize()
 
 
 def main():

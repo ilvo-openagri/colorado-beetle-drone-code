@@ -5,15 +5,16 @@ from timeseries import TimeseriesDbConnector
 import argparse
 import gphoto2 as gp
 import logging
+import numpy as np
 import os
+import cv2
 import requests
 import sys
 import time
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from threading import Event
 
-if os.path.exists(".env.testing"):
-    load_dotenv(".env.testing")
+live_stream_image = None
 
 
 class _Operations:
@@ -151,7 +152,7 @@ def capture_loop_camera(
         minio_controller (MinioController): Controller instance for managing
             MinIO uploads.
     """
-
+    global live_stream_image
     while True:
         if event_running.is_set():
             start_time = time.time()
@@ -172,19 +173,33 @@ def capture_loop_camera(
             )
             unique_filename = f"image_{int(time.time())}.JPG"
             camera_file.save(unique_filename)
+            picture_size = os.path.getsize(unique_filename)
+
+            # Data for live stream:
+            with open(unique_filename, "rb") as file:
+                file_content = file.read()
+            live_stream_image = np.asarray(bytearray(file_content), dtype=np.uint8)
+            live_stream_image = cv2.imdecode(live_stream_image, cv2.IMREAD_COLOR)
+            live_stream_image = cv2.resize(
+                live_stream_image, (100, 100), interpolation=cv2.INTER_LINEAR
+            )
 
             # Write to S3:
             minio_controller.upload_file(
-                bucket=os.environ.get("MINIO_RAW_BUCKET"),
+                bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
                 file_path=unique_filename,
                 object_name=unique_filename,
                 delete=True,
             )
 
+            # Log statistics to the timeseries database
             timeseries_db_controller.add_to_queue(
                 {
                     "picture_time": picture_time,
                     "download_time": time.time() - download_start_time,
+                    "picture_size": picture_size,
+                    "minio_queue_size": len(minio_controller),
+                    "timeseries_queue_size": len(timeseries_db_controller) + 1,
                 }
             )
 
@@ -209,39 +224,79 @@ def capture_loop_test(
         minio_controller (MinioController): Controller instance for managing
             MinIO uploads.
     """
+    global live_stream_image
+    images = [
+        "https://i0.wp.com/www.potatonewstoday.com/wp-content/uploads/2023/06/CPB-Pavlo-from-Pixabay.png?fit=900%2C600&ssl=1",
+        "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTcGL80DcP5w0bNunIFBzkk_vyrXdYuK5Uklg&s",
+        "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSqYu_CbWGn3mKcOq4EBRVXFtBplz1-_vatRg&s",
+    ]
+    image_index = 0
     while True:
-        if event_running.is_set():
-            start_time = time.time()
+        try:
+            if event_running.is_set():
+                start_time = time.time()
 
-            # Simulate capturing the image
-            logger.info("Simulated capture")
+                # Simulate capturing the image
+                logger.debug("Simulated capture")
 
-            picture_time = time.time() - start_time
-            download_start_time = time.time()
-            url = "https://www.google.be/images/branding/googlelogo/1x/googlelogo_light_color_272x92dp.png"
-            unique_filename = f"image_capture_{time.time_ns()}.png"
-            response = requests.get(url, timeout=10)
-            with open(unique_filename, "wb") as file:
-                file.write(response.content)
+                picture_time = time.time() - start_time
+                download_start_time = time.time()
+                url = images[image_index % len(images)]
+                image_index += 1
+                unique_filename = f"image_capture_{time.time_ns()}.png"
+                response = requests.get(url, timeout=10)
+                with open(unique_filename, "wb") as file:
+                    file.write(response.content)
 
-            # Write to S3:
-            minio_controller.upload_file(
-                bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
-                file_path=unique_filename,
-                object_name=unique_filename,
-                delete=True,
-            )
+                # Data for live stream:
+                live_stream_image = np.asarray(
+                    bytearray(response.content), dtype=np.uint8
+                )
+                live_stream_image = cv2.imdecode(live_stream_image, cv2.IMREAD_COLOR)
+                live_stream_image = cv2.resize(
+                    live_stream_image, (100, 100), interpolation=cv2.INTER_LINEAR
+                )
 
-            # Log statistics to the timeseries database
-            timeseries_db_controller.add_to_queue(
-                {
-                    "picture_time": picture_time,
-                    "download_time": time.time() - download_start_time,
-                }
-            )
+                # Write to S3:
+                minio_controller.upload_file(
+                    bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
+                    file_path=unique_filename,
+                    object_name=unique_filename,
+                    delete=True,
+                )
 
-            # Allow some delay to avoid overwhelming the camera
-            time.sleep(1)
+                # Log statistics to the timeseries database
+                timeseries_db_controller.add_to_queue(
+                    {
+                        "picture_time": picture_time,
+                        "download_time": time.time() - download_start_time,
+                        "picture_size": len(response.content),
+                        "minio_queue_size": len(minio_controller),
+                        "timeseries_queue_size": len(timeseries_db_controller) + 1,
+                    }
+                )
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Failed to download image: {e}")
+            continue
+
+        # Allow some delay to avoid overwhelming the camera
+        time.sleep(1)
+
+
+def gen_video_feed():
+    global live_stream_image
+    while True:
+        if live_stream_image is not None:
+            try:
+                ret, buffer = cv2.imencode(".jpg", live_stream_image)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" + buffer.tobytes() + b"\r\n"
+                )
+            except AttributeError as e:
+                time.sleep(1)  # Adjust for frame rate
+                continue
+        time.sleep(1)  # Adjust for frame rate
 
 
 def main(bypass_camera: bool = False):
@@ -324,11 +379,25 @@ def main(bypass_camera: bool = False):
     # Event to control the capture loop
     event_running = Event()
     event_running.clear()
-    Thread(
-        target=capture_loop_test if bypass_camera else capture_loop_camera,
-        args=(logger, event_running, timeseries_db_controller, minio_controller),
-        daemon=True,
-    ).start()
+    if bypass_camera:
+        app_thread = Thread(
+            target=capture_loop_test,
+            args=(logger, event_running, timeseries_db_controller, minio_controller),
+            daemon=True,
+        )
+    else:
+        app_thread = Thread(
+            target=capture_loop_camera,
+            args=(
+                logger,
+                event_running,
+                camera,
+                timeseries_db_controller,
+                minio_controller,
+            ),
+            daemon=True,
+        )
+    app_thread.start()
 
     @app.route("/start", methods=["POST"])
     def start_capture():
@@ -360,8 +429,14 @@ def main(bypass_camera: bool = False):
         status = "running" if event_running.is_set() else "stopped"
         return jsonify({"status": status}), 200
 
+    @app.route("/video_feed")
+    def video_feed():
+        return Response(
+            gen_video_feed(), mimetype="multipart/x-mixed-replace; boundary=frame"
+        )
+
     # Start the Flask app in a separate thread
-    app.run("0.0.0.0", 5000)
+    app.run("192.168.255.5", 5000)
 
     # # Take a picture and download:
     # if bypass_camera:
@@ -385,6 +460,13 @@ if __name__ == "__main__":
         default="INFO",
         help="Set the logging level (default: DEBUG or LOG_LEVEL env variable)",
     )
+    parser.add_argument(
+        "--env",
+        type=str,
+        default=".env.testing",
+        help="Set the environment file to load (default: .env.testing)",
+    )
+
     args = parser.parse_args()
 
     # Set up logging
@@ -392,6 +474,9 @@ if __name__ == "__main__":
         format="[%(levelname)s %(name)s @ %(asctime)s] %(message)s",
         level=getattr(logging, args.log_level, logging.DEBUG),
     )
+
+    # Load environment variables from the specified file
+    load_dotenv(args.env)
 
     # Run the main function
     sys.exit(main(args.test))
