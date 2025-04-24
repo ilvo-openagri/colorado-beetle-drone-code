@@ -1,9 +1,11 @@
+from database import DatabaseApi
 from dotenv import load_dotenv
 from s3 import MinioController
 from threading import Thread
 from timeseries import TimeseriesDbConnector
 import argparse
 import gphoto2 as gp
+import imageio
 import logging
 import numpy as np
 import os
@@ -136,6 +138,7 @@ def capture_loop_camera(
     camera,
     timeseries_db_controller,
     minio_controller: MinioController,
+    database_controller: DatabaseApi,
 ):
     """
     Continuously captures images from a camera, logs the file path, and downloads
@@ -151,10 +154,41 @@ def capture_loop_camera(
             managing and queuing metadata related to the captured images.
         minio_controller (MinioController): Controller instance for managing
             MinIO uploads.
+        database_controller (DatabaseApi): Controller instance for managing
+            database operations.
     """
     global live_stream_image
+    thread_data = {
+        "project_id": -1,
+        "flight_id": -1,
+        "project_name": "",
+        "flight_name": "",
+    }
+
     while True:
         if event_running.is_set():
+            # Determine project and flight:
+            if "PROJECT_ID" not in os.environ:
+                continue
+            if "FLIGHT_ID" not in os.environ:
+                continue
+
+            if thread_data["project_id"] != int(
+                os.environ["PROJECT_ID"]
+            ) and thread_data["flight_id"] != int(os.environ["FLIGHT_ID"]):
+                thread_data["project_id"] = int(os.environ["PROJECT_ID"])
+                thread_data["flight_id"] = int(os.environ["FLIGHT_ID"])
+                project = database_controller.get_project(id=thread_data["project_id"])
+                flight = database_controller.get_flight(id=thread_data["flight_id"])
+                thread_data["project_name"] = project[0]["name"]
+                thread_data["flight_name"] = flight[0]["name"]
+                logger.info(
+                    "Project: %s, Flight: %s",
+                    thread_data["project_name"],
+                    thread_data["flight_name"],
+                )
+
+            # Start image capture:
             start_time = time.time()
 
             # Capture the image with error handling
@@ -172,7 +206,9 @@ def capture_loop_camera(
                 file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
             )
             unique_filename = f"image_{int(time.time())}.JPG"
+            s3_filename = f"{thread_data['project_id']}/{thread_data['flight_id']}/{unique_filename}"
             camera_file.save(unique_filename)
+            image_metadata = imageio.get_reader(unique_filename).get_meta_data()
             picture_size = os.path.getsize(unique_filename)
 
             # Data for live stream:
@@ -184,12 +220,33 @@ def capture_loop_camera(
                 live_stream_image, (100, 100), interpolation=cv2.INTER_LINEAR
             )
 
+            # Add the image reference to the database:
+            image_id = database_controller.post_image(
+                thread_data["flight_id"],
+                {
+                    "storage": s3_filename,
+                    "gps": {
+                        "latitude": 0,
+                        "longitude": 0,
+                    },
+                    "size": {
+                        "width": image_metadata["shape"][0],
+                        "height": image_metadata["shape"][1],
+                    },
+                },
+            )
+
             # Write to S3:
             minio_controller.upload_file(
                 bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
                 file_path=unique_filename,
-                object_name=unique_filename,
+                object_name=s3_filename,
                 delete=True,
+                metadata={
+                    "project_id": thread_data["project_id"],
+                    "flight_id": thread_data["flight_id"],
+                    "image_id": image_id,
+                },
             )
 
             # Log statistics to the timeseries database
@@ -212,6 +269,7 @@ def capture_loop_test(
     event_running: Event,
     timeseries_db_controller,
     minio_controller: MinioController,
+    database_controller: DatabaseApi,
 ):
     """
     Continuously simulates capturing images, downloads them in a separate thread,
@@ -223,8 +281,18 @@ def capture_loop_test(
                                            managing the timeseries database queue.
         minio_controller (MinioController): Controller instance for managing
             MinIO uploads.
+        database_controller (DatabaseApi): Controller instance for managing
+            database operations.
     """
     global live_stream_image
+
+    thread_data = {
+        "project_id": -1,
+        "flight_id": -1,
+        "project_name": "",
+        "flight_name": "",
+    }
+
     images = [
         "https://i0.wp.com/www.potatonewstoday.com/wp-content/uploads/2023/06/CPB-Pavlo-from-Pixabay.png?fit=900%2C600&ssl=1",
         "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTcGL80DcP5w0bNunIFBzkk_vyrXdYuK5Uklg&s",
@@ -234,19 +302,48 @@ def capture_loop_test(
     while True:
         try:
             if event_running.is_set():
+                if "PROJECT_ID" not in os.environ:
+                    continue
+                if "FLIGHT_ID" not in os.environ:
+                    continue
+
+                if thread_data["project_id"] != int(
+                    os.environ["PROJECT_ID"]
+                ) or thread_data["flight_id"] != int(os.environ["FLIGHT_ID"]):
+                    thread_data["project_id"] = int(os.environ["PROJECT_ID"])
+                    thread_data["flight_id"] = int(os.environ["FLIGHT_ID"])
+                    project = database_controller.get_project(
+                        id=thread_data["project_id"]
+                    )
+                    flight = database_controller.get_flight(id=thread_data["flight_id"])
+                    thread_data["project_name"] = project[0]["name"]
+                    thread_data["flight_name"] = flight[0]["name"]
+                    logger.info(
+                        "Project: %s, Flight: %s",
+                        thread_data["project_name"],
+                        thread_data["flight_name"],
+                    )
+
                 start_time = time.time()
 
                 # Simulate capturing the image
-                logger.debug("Simulated capture")
+                logger.info(
+                    "Simulated capture [PROJECT %s FLIGHT %s]",
+                    thread_data["project_name"],
+                    thread_data["flight_name"],
+                )
 
                 picture_time = time.time() - start_time
                 download_start_time = time.time()
                 url = images[image_index % len(images)]
                 image_index += 1
                 unique_filename = f"image_capture_{time.time_ns()}.png"
+                s3_filename = f"{thread_data['project_id']}/{thread_data['flight_id']}/{unique_filename}"
                 response = requests.get(url, timeout=10)
                 with open(unique_filename, "wb") as file:
                     file.write(response.content)
+
+                image_metadata = imageio.get_reader(unique_filename).get_meta_data()
 
                 # Data for live stream:
                 live_stream_image = np.asarray(
@@ -257,12 +354,33 @@ def capture_loop_test(
                     live_stream_image, (100, 100), interpolation=cv2.INTER_LINEAR
                 )
 
+                # Add the image reference to the database:
+                image_id = database_controller.post_image(
+                    thread_data["flight_id"],
+                    {
+                        "storage": s3_filename,
+                        "gps": {
+                            "latitude": 0,
+                            "longitude": 0,
+                        },
+                        "size": {
+                            "width": image_metadata["shape"][0],
+                            "height": image_metadata["shape"][1],
+                        },
+                    },
+                )
+
                 # Write to S3:
                 minio_controller.upload_file(
                     bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
                     file_path=unique_filename,
-                    object_name=unique_filename,
+                    object_name=s3_filename,
                     delete=True,
+                    metadata={
+                        "project_id": thread_data["project_id"],
+                        "flight_id": thread_data["flight_id"],
+                        "image_id": image_id,
+                    },
                 )
 
                 # Log statistics to the timeseries database
@@ -373,6 +491,17 @@ def main(bypass_camera: bool = False):
     )
     minio_controller.start()
 
+    # Initialize database controller:
+    database_controller = DatabaseApi(
+        config={
+            "pg_host": os.environ.get("PG_CLOUD_HOST"),
+            "pg_port": int(os.environ.get("PG_CLOUD_PORT")),
+            "pg_database": os.environ.get("PG_CLOUD_DATABASE"),
+            "pg_user": os.environ.get("PG_CLOUD_USER"),
+            "pg_password": os.environ.get("PG_CLOUD_PASSWORD"),
+        }
+    )
+
     # Create Flask REST API:
     app = Flask(__name__)
 
@@ -382,7 +511,13 @@ def main(bypass_camera: bool = False):
     if bypass_camera:
         app_thread = Thread(
             target=capture_loop_test,
-            args=(logger, event_running, timeseries_db_controller, minio_controller),
+            args=(
+                logger,
+                event_running,
+                timeseries_db_controller,
+                minio_controller,
+                database_controller,
+            ),
             daemon=True,
         )
     else:
@@ -394,6 +529,7 @@ def main(bypass_camera: bool = False):
                 camera,
                 timeseries_db_controller,
                 minio_controller,
+                database_controller,
             ),
             daemon=True,
         )
@@ -407,6 +543,16 @@ def main(bypass_camera: bool = False):
         if event_running.is_set():
             return jsonify({"message": "Capture operation already running"}), 400
 
+        # Read JSON payload
+        payload = request.get_json()
+        if "project_id" not in payload:
+            return jsonify({"error": "Missing project_id in payload"}), 400
+        if "flight_id" not in payload:
+            return jsonify({"error": "Missing flight_id in payload"}), 400
+
+        # Expose project_id and flight_id to capture_loop_camera
+        os.environ["PROJECT_ID"] = str(payload["project_id"])
+        os.environ["FLIGHT_ID"] = str(payload["flight_id"])
         event_running.set()
         return jsonify({"message": "Capture operation started"}), 200
 
@@ -426,8 +572,16 @@ def main(bypass_camera: bool = False):
         """
         Get the current status of the capture operation.
         """
-        status = "running" if event_running.is_set() else "stopped"
-        return jsonify({"status": status}), 200
+        response = {
+            "status": "running" if event_running.is_set() else "stopped",
+        }
+        if event_running.is_set():
+            if "PROJECT_ID" in os.environ:
+                response["project_id"] = os.environ["PROJECT_ID"]
+            if "FLIGHT_ID" in os.environ:
+                response["flight_id"] = os.environ["FLIGHT_ID"]
+
+        return jsonify(response), 200
 
     @app.route("/video_feed")
     def video_feed():

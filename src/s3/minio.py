@@ -13,12 +13,14 @@ class MinioUploadData:
         source (str): The file path or source of the data to be uploaded.
         name (str): The name of the file to be stored in the bucket.
         bucket (str): The name of the target bucket where the file will be uploaded.
+        metadata (dict): Metadata belonging to the file
         delete (bool): Indicates whether to delete the file after upload.
     """
 
     source: str
     name: str
     bucket: str
+    metadata: dict
     delete: bool
 
 
@@ -90,11 +92,18 @@ class MinioController:
                         sample.bucket,
                         sample.name,
                     )
-                    s3_client.upload_file(
-                        sample.source,
-                        sample.bucket,
-                        sample.name,
-                    )
+                    with open(sample.source, "rb") as file_obj:
+                        # Ensure metadata values are ASCII-encoded
+                        ascii_metadata = {
+                            key: str(value).encode("ascii", "ignore").decode("ascii")
+                            for key, value in sample.metadata.items()
+                        }
+                        s3_client.upload_fileobj(
+                            Fileobj=file_obj,
+                            Bucket=sample.bucket,
+                            Key=sample.name,
+                            ExtraArgs={"Metadata": ascii_metadata},
+                        )
 
                     if sample.delete:
                         try:
@@ -154,15 +163,44 @@ class MinioController:
         self._process.join()  # Wait for the process to finish
         self._process = None
 
-    def upload_file(self, file_path, bucket_name, object_name, delete: bool = False):
+    def upload_file(
+        self,
+        file_path: str,
+        bucket_name: str,
+        object_name: str,
+        metadata: dict,
+        delete: bool = False,
+    ):
+        """
+        Uploads a file to the MinIO server.
+
+        Args:
+            file_path (str): The path to the file to be uploaded.
+            bucket_name (str): The name of the target bucket.
+            object_name (str): The name of the object in the bucket.
+            metadata (dict): Dictionary containing metadata
+            delete (bool): Whether to delete the file after upload.
+
+        Raises:
+            RuntimeError: If the data logger process is not running.
+
+        Notes:
+            - The method puts the upload request into a queue for processing.
+            - The file will be uploaded asynchronously in the background.
+            - The `delete` parameter indicates whether to delete the file after upload.
+        """
         if self._process is None:
             raise RuntimeError("Data logger process is not running.")
         self._minio_queue.put(
             MinioUploadData(
-                source=file_path, name=object_name, bucket=bucket_name, delete=delete
+                source=file_path,
+                name=object_name,
+                bucket=bucket_name,
+                metadata=metadata,
+                delete=delete,
             )
         )
-        
+
     def __len__(self) -> int:
         """
         Returns the number of items in the MinIO queue.

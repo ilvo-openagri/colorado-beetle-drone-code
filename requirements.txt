@@ -2,9 +2,11 @@ boto3
 crc==5.0.0
 flask
 gphoto2
+imageio
 influxdb-client
 numpy
 opencv-python
+psycopg2
 python-dotenv
 pyusb==1.2.1
 requests
