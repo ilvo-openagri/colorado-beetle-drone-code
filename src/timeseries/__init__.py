@@ -14,24 +14,25 @@ class TimeseriesDbConnector:
     def __init__(
         self,
         measurement: str,
-        tags: dict,
         telegraf_ip: str = "",
         telegraf_port: int = 8094,
+        tags: dict = {},
     ):
         self._timeseries_queue = Queue()
         self._telegraf_ip = telegraf_ip
         self._telegraf_port = telegraf_port
         self._measurement = measurement
-        self._telegraf_tags = []
         self._process = None
-        self._telegraf_tags = [
-            (
+        self._telegraf_tags = []
+        self.set_tags(tags)
+
+    def set_tags(self, tags: dict):
+        for tag, value in tags.items():
+            self._telegraf_tags.append(
                 f"{tag}={value.replace(' ','-')}"
                 if isinstance(value, str)
                 else f"{tag}={value}"
             )
-            for tag, value in tags.items()
-        ]
 
     def start(self):
         """
@@ -90,7 +91,7 @@ class TimeseriesDbConnector:
         if self._process is None:
             raise RuntimeError("Data logger process is not running.")
         self._timeseries_queue.put(data)
-        
+
     def __len__(self) -> int:
         """
         Returns the number of items in the queue.
@@ -138,7 +139,15 @@ class TimeseriesDbConnector:
         """
         logger = logging.getLogger("_data_logger")
         logger.info(f"Connecting to Telegraf at {telegraf_ip}:{telegraf_port}")
-        sock = socket.create_connection((telegraf_ip, telegraf_port), timeout=5)
+        sock = None
+        while sock is None:
+            try:
+                sock = socket.create_connection((telegraf_ip, telegraf_port), timeout=5)
+            except (ConnectionRefusedError, TimeoutError):
+                logger.error("Connection refused. Re-trying...")
+                sock = None
+                time.sleep(1)
+                continue
         logger.info(f"Connected")
         stop_logging = False
         while not stop_logging or not queue.empty():
@@ -157,8 +166,8 @@ class TimeseriesDbConnector:
                     ]
                 )
                 data = f"{measurement},{tag_set} {field_set} {int(time.time_ns())}\n"
-                sock.send(data.encode("utf-8"))
-                logger.info(f"Sent data: {data}")
+                sock_rc = sock.send(data.encode("utf-8"))
+                logger.info(f"Sent data: {data} [{sock_rc}]")
             except KeyboardInterrupt:
                 stop_logging = True
                 logger.info("Keyboard interrupt received, stopping data logger...")

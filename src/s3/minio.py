@@ -1,6 +1,7 @@
 import boto3
 import logging
 import os
+import urllib.parse
 from dataclasses import dataclass
 from multiprocessing import Process, Queue
 
@@ -86,7 +87,7 @@ class MinioController:
                         logger.error(f"Invalid data type: {type(sample)}")
                         continue
 
-                    logger.debug(
+                    logger.info(
                         "Uploading %s to bucket %s @ %s",
                         sample.source,
                         sample.bucket,
@@ -102,7 +103,9 @@ class MinioController:
                             Fileobj=file_obj,
                             Bucket=sample.bucket,
                             Key=sample.name,
-                            ExtraArgs={"Metadata": ascii_metadata},
+                            ExtraArgs={
+                                "Tagging": urllib.parse.urlencode(ascii_metadata)
+                            },
                         )
 
                     if sample.delete:
@@ -112,7 +115,7 @@ class MinioController:
                         except OSError as e:
                             logger.error("Error deleting file %s: %s", sample.source, e)
 
-                    logger.debug(
+                    logger.info(
                         "Uploaded %s to bucket %s", sample.source, sample.bucket
                     )
                 except KeyboardInterrupt:

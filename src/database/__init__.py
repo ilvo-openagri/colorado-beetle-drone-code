@@ -4,6 +4,8 @@ import logging
 import psycopg2
 import psycopg2.extras
 import time
+import threading
+import queue
 
 
 class DatabaseApi:
@@ -28,11 +30,19 @@ class DatabaseApi:
             raise ValueError("Not all arguments were passed for the DatabaseApi.")
 
         self._config = config
-        self._reconnect()
+        self._connect()
         self._logger.info("Established database connection")
+
+        self._query_queue = queue.Queue()
+        self._worker_thread = threading.Thread(target=self._query_worker, daemon=True)
+        self._worker_thread.start()
 
     def _reconnect(self):
         """(Re-)connect to the database"""
+        self._connect()
+
+    def _connect(self):
+        """Connect to the database"""
         self._db_connection = psycopg2.connect(
             database=self._config["pg_database"],
             host=self._config["pg_host"],
@@ -41,11 +51,13 @@ class DatabaseApi:
             port=self._config["pg_port"],
         )
 
-    def _execute_query(self, query: str) -> list:
+    def _execute_query(self, query: str, commit: bool = False) -> list:
         """Execute a query in the database
 
         Args:
             query (str): Query
+            commit (bool): Whether to commit the transaction
+                (default: False)
 
         Raises:
             RuntimeError: When the database connector raises an exception
@@ -54,28 +66,83 @@ class DatabaseApi:
             list: Results
         """
 
-        try:
-            cursor = self._db_connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
-        except psycopg2.InterfaceError as ex:
-            self._reconnect()
-            cursor = self._db_connection.cursor(
-                cursor_factory=psycopg2.extras.RealDictCursor
-            )
-        try:
-            cursor.execute(query)
-            values = cursor.fetchall()
-            self._db_connection.commit()
-        except psycopg2.errors.UniqueViolation as ex:
-            self._db_connection.rollback()
-            raise RuntimeError("Unique constraint violated") from ex
-        except Exception as ex:
-            self._db_connection.rollback()
-            raise RuntimeError("An error occurred during query execution") from ex
-        finally:
-            cursor.close()
-        return values
+        max_retries = 2  # First attempt + one retry after reconnect
+        attempt = 0
+
+        while attempt < max_retries:
+            attempt += 1
+            cursor = None
+            try:
+                cursor = self._db_connection.cursor(
+                    cursor_factory=psycopg2.extras.RealDictCursor
+                )
+                cursor.execute(query)
+                values = cursor.fetchall()
+                if commit:
+                    self._db_connection.commit()
+                return values
+
+            except (
+                psycopg2.errors.InterfaceError,
+                psycopg2.errors.OperationalError,
+            ) as ex:
+                # Connection issues, try to reconnect once
+                if attempt >= max_retries:
+                    raise RuntimeError(
+                        "Database connection lost and retry failed"
+                    ) from ex
+                self._reconnect()
+                continue  # Retry the query after reconnecting
+
+            except psycopg2.errors.UniqueViolation as ex:
+                self._db_connection.rollback()
+                raise RuntimeError("Unique constraint violated") from ex
+
+            except Exception as ex:
+                self._db_connection.rollback()
+                raise RuntimeError("An error occurred during query execution") from ex
+            finally:
+                if cursor is not None:
+                    cursor.close()
+
+        raise RuntimeError("Query execution failed after retries")
+
+    def _query_worker(self):
+        while True:
+            item = self._query_queue.get()
+            if item is None:
+                break  # Sentinel to stop the thread
+            query, commit, result_queue = item
+            try:
+                result = self._execute_query(query, commit)
+                self._logger.info(f"Executed query")
+                if result_queue:
+                    result_queue.put(result)
+            except Exception as ex:
+                if result_queue:
+                    result_queue.put(ex)
+            finally:
+                self._query_queue.task_done()
+
+    def enqueue_query(self, query: str, commit: bool = False, wait: bool = True):
+        """
+        Enqueue a query for execution in the background thread.
+        If wait=True, blocks until result is available and returns it.
+        If wait=False, returns immediately (no result).
+        """
+        result_queue = queue.Queue() if wait else None
+        self._logger.info("Enqueuing query")
+        self._query_queue.put((query, commit, result_queue))
+        if wait:
+            result = result_queue.get()
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    def stop_worker(self):
+        """Stop the worker thread gracefully."""
+        self._query_queue.put(None)
+        self._worker_thread.join()
 
     # /projects
     def get_project(self, **kwargs):
@@ -85,8 +152,7 @@ class DatabaseApi:
             where = f"WHERE id = '{kwargs['id']}'"
         elif "name" in kwargs:
             where = f"WHERE name = '{kwargs['name']}'"
-
-        values = self._execute_query(f"SELECT * from projects project {where}")
+        values = self.enqueue_query(f"SELECT * from projects project {where}")
         return values
 
     def get_project_summary(self, **kwargs):
@@ -102,7 +168,7 @@ class DatabaseApi:
         if "end" in kwargs:
             where += f" AND flight.timestamp_epoch < {kwargs['end']}"
 
-        values = self._execute_query(
+        values = self.enqueue_query(
             f"""SELECT 
             project.id as project_id,
             flight.id as flight_id,
@@ -115,7 +181,6 @@ class DatabaseApi:
                 GROUP BY flight.id
             ) as image_count,
             (
-            
                 SELECT COUNT(DISTINCT image.id)
                 FROM images image
                 INNER JOIN detections detection ON image.id = detection.image_id
@@ -123,7 +188,6 @@ class DatabaseApi:
                 GROUP BY flight.id
             ) as detection_count,
             (
-            
                 SELECT COUNT(*)
                 FROM images image
                 LEFT JOIN detections detection ON image.id = detection.image_id
@@ -146,12 +210,13 @@ class DatabaseApi:
         Returns:
             int: Project ID
         """
-        values = self._execute_query(
+        values = self.enqueue_query(
             f"""
             INSERT INTO projects (name) 
             VALUES ('{name}')
             RETURNING id;
-            """
+            """,
+            commit=True,
         )
         return values[0]["id"]
 
@@ -162,7 +227,7 @@ class DatabaseApi:
         where = ""
         if "id" in kwargs:
             where = f"WHERE id = '{kwargs['id']}'"
-        values = self._execute_query(f"SELECT * from flights {where}")
+        values = self.enqueue_query(f"SELECT * from flights {where}")
         return values
 
     def post_flight(
@@ -179,12 +244,13 @@ class DatabaseApi:
         Returns:
             int: Flight ID
         """
-        values = self._execute_query(
+        values = self.enqueue_query(
             f"""
             INSERT INTO flights (project_id, name, timestamp_epoch) 
             VALUES ('{project_id}', '{flight_name}', {timestamp_epoch})
             RETURNING id;
-            """
+            """,
+            commit=True,
         )
         return values[0]["id"]
 
@@ -199,7 +265,7 @@ class DatabaseApi:
         Returns:
             List: Image descriptions
         """
-        values = self._execute_query(
+        values = self.enqueue_query(
             f"""
             SELECT image.*, COUNT(detection.*) as detection_count
             FROM images image
@@ -232,25 +298,23 @@ class DatabaseApi:
         Raises:
             psycopg2.Error: If there is an issue executing the database query.
         """
-
-        query = "INSERT INTO images (flight_id, storage_location, gps_location, width, height) values (%s, %s, POINT(%s, %s), %s, %s) RETURNING ID"
-        with self._db_connection.cursor(
-            cursor_factory=psycopg2.extras.RealDictCursor
-        ) as cursor:
-            cursor.execute(
-                query,
-                (
-                    flight_id,
-                    image["storage"],
-                    image["gps"]["latitude"],
-                    image["gps"]["longitude"],
-                    image["size"]["width"],
-                    image["size"]["height"],
-                ),
+        measurements = self.enqueue_query(
+            f"""
+            INSERT INTO images (flight_id, storage_location, gps_location, width, height)
+            values (
+                {flight_id},
+                '{image['storage']}',
+                POINT({image['gps']['latitude']}, {image['gps']['longitude']}),
+                {image['size']['width']},
+                {image['size']['height']}
             )
-            measurement = cursor.fetchone()
-        self._db_connection.commit()
-        return measurement["id"]
+            RETURNING ID""",
+            commit=True,
+        )
+        if not measurements:
+            return -1
+        else:
+            return measurements[0]["id"]
 
     # ------------------------
     # /detections
@@ -263,7 +327,7 @@ class DatabaseApi:
         Returns:
             List: Detection descriptions
         """
-        values = self._execute_query(
+        values = self.enqueue_query(
             f"""
             SELECT detection.*
             FROM detections detection

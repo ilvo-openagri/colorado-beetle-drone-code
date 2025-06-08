@@ -1,20 +1,23 @@
 from database import DatabaseApi
 from dotenv import load_dotenv
+from flask import Flask, jsonify, request, Response
 from s3 import MinioController
+from threading import Event
 from threading import Thread
 from timeseries import TimeseriesDbConnector
 import argparse
+import cv2
 import gphoto2 as gp
 import imageio
 import logging
 import numpy as np
 import os
-import cv2
+import re
 import requests
+import subprocess
 import sys
+import threading
 import time
-from flask import Flask, jsonify, request, Response
-from threading import Event
 
 live_stream_image = None
 
@@ -89,6 +92,17 @@ class CameraFolderOperations(_Operations):
         super().__init__(bitmap)
 
 
+class ThreadState:
+    """
+    This class provides a simple interface to track the running state of a thread
+    and store a message associated with that state.
+    """
+
+    def __init__(self):
+        self.is_running: bool = False
+        self.message: str = ""
+
+
 def tree(camera: gp.Camera, folder: str, depth: int = 0):
     """
     Recursively prints the folder structure of a camera.
@@ -132,11 +146,119 @@ def get_files(camera: gp.Camera, folder: str, suffix: str) -> list:
     return matching_files
 
 
-def capture_loop_camera(
-    logger,
+def handle_gphoto2_output(
+    logger: logging.Logger,
+    params: dict,
+    process: subprocess.Popen,
     event_running: Event,
-    camera,
-    timeseries_db_controller,
+    timeseries_db_controller: TimeseriesDbConnector,
+    minio_controller: MinioController,
+    database_controller: DatabaseApi,
+):
+    """
+    Handles the output of a gphoto2 process.
+    Args:
+        process (subprocess.Popen): The gphoto2 process to handle.
+    """
+    re_saving_file = re.compile(r"Saving file as.*")
+    re_delete_file = re.compile(r"Deleting file /(.*.jpg) on the camera")
+    re_capture = re.compile(r"Capturing frame.*")
+    ts_capture = 0
+    ts_saving = 0
+    while event_running.is_set():
+        output = process.stdout.readline()
+        if output == b"" and process.poll() is not None:
+            break
+        if not output:
+            continue
+        output = output.strip().decode("utf-8")
+
+        # Check for the capture start message:
+        match_capture = re_capture.match(output)
+        if match_capture:
+            ts_capture = time.time()
+            continue
+
+        # Check for the saving file message:
+        match_saving_file = re_saving_file.match(output)
+        if match_saving_file:
+            ts_saving = time.time()
+            continue
+
+        # Check for the delete file message:
+        match_delete_file = re_delete_file.match(output)
+        if match_delete_file:
+            ts_deleting = time.time()
+            picture_file = match_delete_file.group(1)
+            logger.info("Handling file %s", picture_file)
+            s3_filename = f"{params['project_id']}/{params['flight_id']}/image_{int(time.time())}.JPG"
+            logger.info("Writing to %s", s3_filename)
+            image_metadata = imageio.get_reader(picture_file).get_meta_data()
+            picture_size = os.path.getsize(picture_file)
+
+            # Data for live stream:
+            with open(picture_file, "rb") as file:
+                file_content = file.read()
+            live_stream_image = np.asarray(bytearray(file_content), dtype=np.uint8)
+            live_stream_image = cv2.imdecode(live_stream_image, cv2.IMREAD_COLOR)
+            live_stream_image = cv2.resize(
+                live_stream_image, (100, 100), interpolation=cv2.INTER_LINEAR
+            )
+            try:
+                # Add the image reference to the database:
+                image_id = database_controller.post_image(
+                    params["flight_id"],
+                    {
+                        "storage": s3_filename,
+                        "gps": {
+                            "latitude": 0,
+                            "longitude": 0,
+                        },
+                        "size": {
+                            "width": image_metadata["shape"][0],
+                            "height": image_metadata["shape"][1],
+                        },
+                    },
+                )
+
+                # Write to S3:
+                minio_controller.upload_file(
+                    bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
+                    file_path=picture_file,
+                    object_name=s3_filename,
+                    delete=True,
+                    metadata={
+                        "project_id": params["project_id"],
+                        "flight_id": params["flight_id"],
+                        "image_id": image_id,
+                    },
+                )
+
+                # Log statistics to the timeseries database
+                timeseries_db_controller.add_to_queue(
+                    {
+                        "picture_time": ts_saving - ts_capture,
+                        "download_time": ts_deleting - ts_saving,
+                        "picture_size": picture_size,
+                        "minio_queue_size": len(minio_controller),
+                        "timeseries_queue_size": len(timeseries_db_controller) + 1,
+                    }
+                )
+            except RuntimeError as ex:
+                pass
+
+        # Allow some delay to not lock the thread:
+        time.sleep(0.1)
+
+    rc = process.poll()
+    return rc
+
+
+def capture_loop_gphoto2_cli(
+    logger: logging.Logger,
+    app_state: ThreadState,
+    event_running: Event,
+    timeseries_db_controller: TimeseriesDbConnector,
     minio_controller: MinioController,
     database_controller: DatabaseApi,
 ):
@@ -147,18 +269,17 @@ def capture_loop_camera(
     Args:
         logger (logging.Logger): Logger instance for logging information about the
             captured images.
+        debug (bool): If True, enables debug mode for the GPHOTO2 library.
         event_running (Event): Event object to control the capture loop.
-        camera (gphoto2.Camera): Camera instance used to capture images and retrieve
-            files.
-        timeseries_db_controller (object): Controller instance responsible for
+        timeseries_db_controller (TimeseriesDbConnector): Controller instance responsible for
             managing and queuing metadata related to the captured images.
         minio_controller (MinioController): Controller instance for managing
             MinIO uploads.
         database_controller (DatabaseApi): Controller instance for managing
             database operations.
     """
-    global live_stream_image
-    thread_data = {
+
+    params = {
         "project_id": -1,
         "flight_id": -1,
         "project_name": "",
@@ -166,63 +287,204 @@ def capture_loop_camera(
     }
 
     while True:
+        # Check if the event is set to run:
+        app_state.is_running = event_running.is_set()
+        if not app_state.is_running:
+            time.sleep(1)
+            continue
+        app_state.message = "Running"
+
+        # Determine project and flight:
+        if "PROJECT_ID" not in os.environ:
+            continue
+        if "FLIGHT_ID" not in os.environ:
+            continue
+
+        if params["project_id"] != int(os.environ["PROJECT_ID"]) and params[
+            "flight_id"
+        ] != int(os.environ["FLIGHT_ID"]):
+            params["project_id"] = int(os.environ["PROJECT_ID"])
+            params["flight_id"] = int(os.environ["FLIGHT_ID"])
+            project = database_controller.get_project(id=params["project_id"])
+            flight = database_controller.get_flight(id=params["flight_id"])
+            params["project_name"] = project[0]["name"]
+            params["flight_name"] = flight[0]["name"]
+            logger.info(
+                "Project: %s, Flight: %s",
+                params["project_name"],
+                params["flight_name"],
+            )
+
+        # Check if the camera is connected:
+        logger.info("Capturing images using gphoto2 CLI")
+        camera = {}
+        while len(camera) == 0:
+            gphoto2_detect = (
+                subprocess.run(["gphoto2", "--auto-detect"], capture_output=True)
+                .stdout.decode()
+                .splitlines()
+            )
+            if len(gphoto2_detect) < 3:
+                logger.error("No camera detected")
+                time.sleep(2)
+                continue
+            model_offset = re.search(" *usb", gphoto2_detect[2]).start()
+            port_offset = re.search("usb", gphoto2_detect[2]).start()
+            camera = {
+                "model": gphoto2_detect[2][0:model_offset].strip(),
+                "port": gphoto2_detect[2][port_offset:].strip(),
+            }
+        logger.info("Camera detected: %s", camera["model"])
+        timeseries_db_controller.set_tags(camera)
+        timeseries_db_controller.start()
+
+        # Take a focus shot:
+        if False:
+            logger.info("Focusing camera")
+            subprocess.run(
+                [
+                    "gphoto2",
+                    "--set-config",
+                    "/main/capturesettings/focusmode=1",
+                    "--trigger-capture",
+                ]
+            )
+
+        # Start capture loop:
+        time.sleep(1)
+        logger.info("Starting capture loop")
+        capture_process = subprocess.Popen(
+            [
+                "gphoto2",
+                "--set-config",
+                "/main/capturesettings/focusmode=0",
+                "--capture-image-and-download",
+                "--interval=5",
+                "--force-overwrite",
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,  # Optional: merge stderr with stdout
+            bufsize=1,
+        )
+        # Start a thread to read the output
+        capture_read_thread = threading.Thread(
+            target=handle_gphoto2_output,
+            args=(
+                logger,
+                params,
+                capture_process,
+                event_running,
+                timeseries_db_controller,
+                minio_controller,
+                database_controller,
+            ),
+            daemon=True,
+        )
+
+        capture_read_thread.start()
+
+        # Keep running until the event is cleared:
+        while event_running.is_set():
+            time.sleep(1)
+
+        capture_process.terminate()
+        capture_read_thread.join()
+
+
+        timeseries_db_controller.stop()
+
+        # Complete:
+        logger.info("Clean-up completed")
+
+
+def capture_loop_test(
+    logger: logging.Logger,
+    app_state: ThreadState,
+    event_running: Event,
+    timeseries_db_controller: TimeseriesDbConnector,
+    minio_controller: MinioController,
+    database_controller: DatabaseApi,
+):
+    """
+    Continuously simulates capturing images, downloads them in a separate thread,
+    and logs the download time to a timeseries database.
+    Args:
+        logger (logging.Logger): Logger instance for logging messages.
+        event_running (Event): Event object to control the capture loop.
+        timeseries_db_controller (object): Controller object responsible for
+                                           managing the timeseries database queue.
+        minio_controller (MinioController): Controller instance for managing
+            MinIO uploads.
+    """
+    params = {
+        "project_id": -1,
+        "flight_id": -1,
+        "project_name": "",
+        "flight_name": "",
+        "download": False,
+    }
+    timeseries_db_controller.set_tags(
+        {
+            "model": "test_model",
+            "port": "test_port",
+        }
+    )
+    timeseries_db_controller.start()
+
+    while True:
+        # Check if the event is set to run:
+        app_state.is_running = event_running.is_set()
+        if not app_state.is_running:
+            time.sleep(1)
+            continue
+        app_state.message = "Running"
+
+        # Determine project and flight:
+        if "PROJECT_ID" not in os.environ:
+            continue
+        if "FLIGHT_ID" not in os.environ:
+            continue
+
+        if params["project_id"] != int(os.environ["PROJECT_ID"]) and params[
+            "flight_id"
+        ] != int(os.environ["FLIGHT_ID"]):
+            params["project_id"] = int(os.environ["PROJECT_ID"])
+            params["flight_id"] = int(os.environ["FLIGHT_ID"])
+            project = database_controller.get_project(id=params["project_id"])
+            flight = database_controller.get_flight(id=params["flight_id"])
+            params["project_name"] = project[0]["name"]
+            params["flight_name"] = flight[0]["name"]
+            logger.info(
+                "Project: %s, Flight: %s",
+                params["project_name"],
+                params["flight_name"],
+            )
+
         if event_running.is_set():
-            # Determine project and flight:
-            if "PROJECT_ID" not in os.environ:
-                continue
-            if "FLIGHT_ID" not in os.environ:
-                continue
-
-            if thread_data["project_id"] != int(
-                os.environ["PROJECT_ID"]
-            ) and thread_data["flight_id"] != int(os.environ["FLIGHT_ID"]):
-                thread_data["project_id"] = int(os.environ["PROJECT_ID"])
-                thread_data["flight_id"] = int(os.environ["FLIGHT_ID"])
-                project = database_controller.get_project(id=thread_data["project_id"])
-                flight = database_controller.get_flight(id=thread_data["flight_id"])
-                thread_data["project_name"] = project[0]["name"]
-                thread_data["flight_name"] = flight[0]["name"]
-                logger.info(
-                    "Project: %s, Flight: %s",
-                    thread_data["project_name"],
-                    thread_data["flight_name"],
-                )
-
-            # Start image capture:
             start_time = time.time()
 
-            # Capture the image with error handling
-            try:
-                file_path = camera.capture(gp.GP_CAPTURE_IMAGE)
-                logger.info(f"{file_path.folder}, {file_path.name}")
-            except gp.GPhoto2Error as ex:
-                logger.error(f"Failed to capture image: {ex}")
-                time.sleep(1)  # Allow some delay before retrying
-                continue
+            # Simulate capturing the image
+            logger.info("Simulated capture")
 
             picture_time = time.time() - start_time
             download_start_time = time.time()
-            camera_file = camera.file_get(
-                file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
-            )
-            unique_filename = f"image_{int(time.time())}.JPG"
-            s3_filename = f"{thread_data['project_id']}/{thread_data['flight_id']}/{unique_filename}"
-            camera_file.save(unique_filename)
-            image_metadata = imageio.get_reader(unique_filename).get_meta_data()
-            picture_size = os.path.getsize(unique_filename)
+            if params["download"]:
+                url = "https://www.google.be/images/branding/googlelogo/1x/googlelogo_light_color_272x92dp.png"
+                unique_filename = f"image_capture_{time.time_ns()}.png"
+                response = requests.get(url, timeout=10)
+                s3_filename = f"{params['project_id']}/{params['flight_id']}/image_{int(time.time())}.JPG"
+                with open(unique_filename, "wb") as file:
+                    file.write(response.content)
+            else:
+                unique_filename = "test_image.JPG"
+                s3_filename = f"{params['project_id']}/{params['flight_id']}/image_{int(time.time())}.JPG"
 
-            # Data for live stream:
-            with open(unique_filename, "rb") as file:
-                file_content = file.read()
-            live_stream_image = np.asarray(bytearray(file_content), dtype=np.uint8)
-            live_stream_image = cv2.imdecode(live_stream_image, cv2.IMREAD_COLOR)
-            live_stream_image = cv2.resize(
-                live_stream_image, (100, 100), interpolation=cv2.INTER_LINEAR
-            )
+            # Determine image metadata:
+            image_metadata = imageio.get_reader(unique_filename).get_meta_data()
 
             # Add the image reference to the database:
             image_id = database_controller.post_image(
-                thread_data["flight_id"],
+                params["flight_id"],
                 {
                     "storage": s3_filename,
                     "gps": {
@@ -241,10 +503,10 @@ def capture_loop_camera(
                 bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
                 file_path=unique_filename,
                 object_name=s3_filename,
-                delete=True,
+                delete=params["download"],
                 metadata={
-                    "project_id": thread_data["project_id"],
-                    "flight_id": thread_data["flight_id"],
+                    "project_id": params["project_id"],
+                    "flight_id": params["flight_id"],
                     "image_id": image_id,
                 },
             )
@@ -254,151 +516,11 @@ def capture_loop_camera(
                 {
                     "picture_time": picture_time,
                     "download_time": time.time() - download_start_time,
-                    "picture_size": picture_size,
-                    "minio_queue_size": len(minio_controller),
-                    "timeseries_queue_size": len(timeseries_db_controller) + 1,
                 }
             )
 
             # Allow some delay to avoid overwhelming the camera
-            time.sleep(0.1)
-
-
-def capture_loop_test(
-    logger,
-    event_running: Event,
-    timeseries_db_controller,
-    minio_controller: MinioController,
-    database_controller: DatabaseApi,
-):
-    """
-    Continuously simulates capturing images, downloads them in a separate thread,
-    and logs the download time to a timeseries database.
-    Args:
-        logger (logging.Logger): Logger instance for logging messages.
-        event_running (Event): Event object to control the capture loop.
-        timeseries_db_controller (object): Controller object responsible for
-                                           managing the timeseries database queue.
-        minio_controller (MinioController): Controller instance for managing
-            MinIO uploads.
-        database_controller (DatabaseApi): Controller instance for managing
-            database operations.
-    """
-    global live_stream_image
-
-    thread_data = {
-        "project_id": -1,
-        "flight_id": -1,
-        "project_name": "",
-        "flight_name": "",
-    }
-
-    images = [
-        "https://i0.wp.com/www.potatonewstoday.com/wp-content/uploads/2023/06/CPB-Pavlo-from-Pixabay.png?fit=900%2C600&ssl=1",
-        "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTcGL80DcP5w0bNunIFBzkk_vyrXdYuK5Uklg&s",
-        "https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSqYu_CbWGn3mKcOq4EBRVXFtBplz1-_vatRg&s",
-    ]
-    image_index = 0
-    while True:
-        try:
-            if event_running.is_set():
-                if "PROJECT_ID" not in os.environ:
-                    continue
-                if "FLIGHT_ID" not in os.environ:
-                    continue
-
-                if thread_data["project_id"] != int(
-                    os.environ["PROJECT_ID"]
-                ) or thread_data["flight_id"] != int(os.environ["FLIGHT_ID"]):
-                    thread_data["project_id"] = int(os.environ["PROJECT_ID"])
-                    thread_data["flight_id"] = int(os.environ["FLIGHT_ID"])
-                    project = database_controller.get_project(
-                        id=thread_data["project_id"]
-                    )
-                    flight = database_controller.get_flight(id=thread_data["flight_id"])
-                    thread_data["project_name"] = project[0]["name"]
-                    thread_data["flight_name"] = flight[0]["name"]
-                    logger.info(
-                        "Project: %s, Flight: %s",
-                        thread_data["project_name"],
-                        thread_data["flight_name"],
-                    )
-
-                start_time = time.time()
-
-                # Simulate capturing the image
-                logger.info(
-                    "Simulated capture [PROJECT %s FLIGHT %s]",
-                    thread_data["project_name"],
-                    thread_data["flight_name"],
-                )
-
-                picture_time = time.time() - start_time
-                download_start_time = time.time()
-                url = images[image_index % len(images)]
-                image_index += 1
-                unique_filename = f"image_capture_{time.time_ns()}.png"
-                s3_filename = f"{thread_data['project_id']}/{thread_data['flight_id']}/{unique_filename}"
-                response = requests.get(url, timeout=10)
-                with open(unique_filename, "wb") as file:
-                    file.write(response.content)
-
-                image_metadata = imageio.get_reader(unique_filename).get_meta_data()
-
-                # Data for live stream:
-                live_stream_image = np.asarray(
-                    bytearray(response.content), dtype=np.uint8
-                )
-                live_stream_image = cv2.imdecode(live_stream_image, cv2.IMREAD_COLOR)
-                live_stream_image = cv2.resize(
-                    live_stream_image, (100, 100), interpolation=cv2.INTER_LINEAR
-                )
-
-                # Add the image reference to the database:
-                image_id = database_controller.post_image(
-                    thread_data["flight_id"],
-                    {
-                        "storage": s3_filename,
-                        "gps": {
-                            "latitude": 0,
-                            "longitude": 0,
-                        },
-                        "size": {
-                            "width": image_metadata["shape"][0],
-                            "height": image_metadata["shape"][1],
-                        },
-                    },
-                )
-
-                # Write to S3:
-                minio_controller.upload_file(
-                    bucket_name=os.environ.get("MINIO_RAW_BUCKET"),
-                    file_path=unique_filename,
-                    object_name=s3_filename,
-                    delete=True,
-                    metadata={
-                        "project_id": thread_data["project_id"],
-                        "flight_id": thread_data["flight_id"],
-                        "image_id": image_id,
-                    },
-                )
-
-                # Log statistics to the timeseries database
-                timeseries_db_controller.add_to_queue(
-                    {
-                        "picture_time": picture_time,
-                        "download_time": time.time() - download_start_time,
-                        "picture_size": len(response.content),
-                        "minio_queue_size": len(minio_controller),
-                        "timeseries_queue_size": len(timeseries_db_controller) + 1,
-                    }
-                )
-        except requests.exceptions.RequestException as e:
-            logger.error(f"Failed to download image: {e}")
-            continue
-
-        # Allow some delay to avoid overwhelming the camera
-        time.sleep(1)
+            time.sleep(5)
 
 
 def gen_video_feed():
@@ -417,71 +539,29 @@ def gen_video_feed():
         time.sleep(1)  # Adjust for frame rate
 
 
-def main(bypass_camera: bool = False):
+def main(bypass_camera: bool = False, debug: bool = False):
     """
     Main function to initialize the camera, connect to a timeseries database, and continuously capture and save images.
     It captures images from the camera, saves them to the local filesystem, and logs the time taken for capturing and downloading each image.
 
     Args:
         bypass_camera (bool): If True, bypasses the camera initialization and runs in test mode.
+        debug (bool): If True, enables debug mode for the GPHOTO2 library.
 
     Raises:
         gp.GPhoto2Error: If an unhandled gphoto2 error occurs during camera initialization.
     """
     logger = logging.getLogger(__name__)
 
-    # Initialize the camera
-    if bypass_camera:
-        camera_model = "Simulated Camera"
-        logger.info("Bypassing camera initialization for testing.")
-    else:
-        camera_initialized = False
-        camera = gp.Camera()
-        while not camera_initialized:
-            try:
-                camera.init()
-                camera_initialized = True
-            except gp.GPhoto2Error as ex:
-                if ex.code == gp.GP_ERROR_MODEL_NOT_FOUND:
-                    print(f"Please connect and switch on your camera [{ex}]")
-                    time.sleep(2)
-                    continue
-                # some other error we can't handle here
-                raise
-
-        camera_abilities = gp.gp_camera_get_abilities(camera)
-
-        if isinstance(camera_abilities, (tuple, list)) and camera_abilities[0] == 0:
-            camera_abilities = camera_abilities[1]
-
-        camera_model = camera_abilities.model
-
-        # Print camera information:
-        logger.debug("Camera summary: %s", camera.get_summary())
-        logger.debug("Camera model %s", camera_abilities.model)
-        logger.debug(
-            "Camera allowed operations %s",
-            CameraOperations(camera_abilities.operations).values,
-        )
-        logger.debug(
-            "Camera allowed file operations %s",
-            CameraFileOperations(camera_abilities.file_operations).values,
-        )
-        logger.debug(
-            "Camera allowed folder operations %s",
-            CameraFolderOperations(camera_abilities.folder_operations).values,
-        )
+    # Main state to keep track of the thread state:
+    main_state = ThreadState()
 
     # Connect to the timeseries database
     timeseries_db_controller = TimeseriesDbConnector(
         measurement="raspi-camera",
         telegraf_ip=os.environ.get("TELEGRAF_IP"),
         telegraf_port=os.environ.get("TELEGRAF_PORT"),
-        tags={
-            "device": camera_model,
-        },
     )
-    timeseries_db_controller.start()
 
     # Initialize MinIO controller:
     minio_controller = MinioController(
@@ -508,31 +588,18 @@ def main(bypass_camera: bool = False):
     # Event to control the capture loop
     event_running = Event()
     event_running.clear()
-    if bypass_camera:
-        app_thread = Thread(
-            target=capture_loop_test,
-            args=(
-                logger,
-                event_running,
-                timeseries_db_controller,
-                minio_controller,
-                database_controller,
-            ),
-            daemon=True,
-        )
-    else:
-        app_thread = Thread(
-            target=capture_loop_camera,
-            args=(
-                logger,
-                event_running,
-                camera,
-                timeseries_db_controller,
-                minio_controller,
-                database_controller,
-            ),
-            daemon=True,
-        )
+    app_thread = Thread(
+        target=capture_loop_gphoto2_cli,
+        args=(
+            logger,
+            main_state,
+            event_running,
+            timeseries_db_controller,
+            minio_controller,
+            database_controller,
+        ),
+        daemon=True,
+    )
     app_thread.start()
 
     @app.route("/start", methods=["POST"])
@@ -573,7 +640,8 @@ def main(bypass_camera: bool = False):
         Get the current status of the capture operation.
         """
         response = {
-            "status": "running" if event_running.is_set() else "stopped",
+            "status": main_state.is_running,
+            "message": main_state.message,
         }
         if event_running.is_set():
             if "PROJECT_ID" in os.environ:
@@ -590,7 +658,7 @@ def main(bypass_camera: bool = False):
         )
 
     # Start the Flask app in a separate thread
-    app.run("192.168.255.5", 5000)
+    app.run("10.8.0.9", 5000)
 
     # # Take a picture and download:
     # if bypass_camera:
@@ -606,6 +674,12 @@ if __name__ == "__main__":
         "--test",
         action=argparse.BooleanOptionalAction,
         help="Run the script in test mode (no actual camera interaction)",
+    )
+    parser.add_argument(
+        "--debug",
+        type=str,
+        action=argparse.BooleanOptionalAction,
+        help="Run the GPHOTO2 library in debug mode for extra output.",
     )
     parser.add_argument(
         "--log-level",
@@ -633,4 +707,4 @@ if __name__ == "__main__":
     load_dotenv(args.env)
 
     # Run the main function
-    sys.exit(main(args.test))
+    sys.exit(main(args.test, args.debug))
