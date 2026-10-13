@@ -1,7 +1,9 @@
+from time import time
 import boto3
 import logging
 import os
 import urllib.parse
+import time
 from dataclasses import dataclass
 from multiprocessing import Process, Queue
 
@@ -88,11 +90,13 @@ class MinioController:
                         continue
 
                     logger.info(
-                        "Uploading %s to bucket %s @ %s",
+                        "Uploading %s to bucket %s [%s] @ %s",
                         sample.source,
                         sample.bucket,
+                        minio_url,
                         sample.name,
                     )
+                    start_time = time.time()
                     with open(sample.source, "rb") as file_obj:
                         # Ensure metadata values are ASCII-encoded
                         ascii_metadata = {
@@ -116,7 +120,10 @@ class MinioController:
                             logger.error("Error deleting file %s: %s", sample.source, e)
 
                     logger.info(
-                        "Uploaded %s to bucket %s", sample.source, sample.bucket
+                        "Uploaded %s to bucket %s in %f seconds",
+                        sample.source,
+                        sample.bucket,
+                        time.time() - start_time,
                     )
                 except KeyboardInterrupt:
                     stop_writing = True

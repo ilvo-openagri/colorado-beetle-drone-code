@@ -20,76 +20,7 @@ import threading
 import time
 
 live_stream_image = None
-
-
-class _Operations:
-    """
-    A class to handle operations based on a bitmap and a predefined set of allowed operations.
-    """
-
-    _allowed_operations = {}
-
-    def __init__(self, bitmap: int):
-        self.values = []
-        for key, value in self._allowed_operations.items():
-            if key & bitmap == 0:
-                continue
-            self.values.append(value)
-
-
-class CameraOperations(_Operations):
-    """
-    A class to handle camera operations based on a bitmap of allowed operations.
-    This class extends the `_Operations` base class and provides a mapping of
-    operation constants to their corresponding string representations.
-    """
-
-    def __init__(self, bitmap: int):
-        self._allowed_operations = {
-            gp.GP_OPERATION_NONE: "NONE",
-            gp.GP_OPERATION_CAPTURE_IMAGE: "CAPTURE_IMAGE",
-            gp.GP_OPERATION_CAPTURE_VIDEO: "CAPTURE_VIDEO",
-            gp.GP_OPERATION_CAPTURE_AUDIO: "CAPTURE_AUDIO",
-            gp.GP_OPERATION_CAPTURE_PREVIEW: "CAPTURE_PREVIEW",
-            gp.GP_OPERATION_CONFIG: "CONFIG",
-            gp.GP_OPERATION_TRIGGER_CAPTURE: "TRIGGER_CAPTURE",
-        }
-        super().__init__(bitmap)
-
-
-class CameraFileOperations(_Operations):
-    """
-    A class to handle file operations for a camera, extending the base `_Operations` class.
-    """
-
-    def __init__(self, bitmap: int):
-        self._allowed_operations = {
-            gp.GP_FILE_OPERATION_NONE: "NONE",
-            gp.GP_FILE_OPERATION_DELETE: "DELETE",
-            gp.GP_FILE_OPERATION_PREVIEW: "PREVIEW",
-            gp.GP_FILE_OPERATION_RAW: "RAW",
-            gp.GP_FILE_OPERATION_AUDIO: "AUDIO",
-            gp.GP_FILE_OPERATION_EXIF: "EXIF",
-        }
-        super().__init__(bitmap)
-
-
-class CameraFolderOperations(_Operations):
-    """
-    A class to handle camera folder operations based on a bitmap of allowed operations.
-    This class extends the `_Operations` base class and provides a mapping of
-    folder operation constants to their string representations.
-    """
-
-    def __init__(self, bitmap: int):
-        self._allowed_operations = {
-            gp.GP_FOLDER_OPERATION_NONE: "NONE",
-            gp.GP_FOLDER_OPERATION_DELETE_ALL: "DELETE_ALL",
-            gp.GP_FOLDER_OPERATION_PUT_FILE: "PUT_FILE",
-            gp.GP_FOLDER_OPERATION_MAKE_DIR: "MAKE_DIR",
-            gp.GP_FOLDER_OPERATION_REMOVE_DIR: "REMOVE_DIR",
-        }
-        super().__init__(bitmap)
+os.environ["NUMBER_OF_CAPTURES"] = "0"
 
 
 class ThreadState:
@@ -101,49 +32,6 @@ class ThreadState:
     def __init__(self):
         self.is_running: bool = False
         self.message: str = ""
-
-
-def tree(camera: gp.Camera, folder: str, depth: int = 0):
-    """
-    Recursively prints the folder structure of a camera.
-    Args:
-        camera (gphoto2.Camera): Camera instance used to retrieve folder structure.
-        folder (str): The folder path on the camera to start printing from.
-        depth (int): The current depth in the folder structure for indentation.
-    """
-    for entry in gp.gp_camera_folder_list_files(camera, folder)[1]:
-        file_entry = entry[0]
-        print(f"{' '*depth*2}|-- {file_entry}")
-    for entry in gp.gp_camera_folder_list_folders(camera, folder)[1]:
-        folder_entry = entry[0]
-        print(f"{' '*depth*2}\-- {folder_entry}")
-        tree(camera, f"{folder}{folder_entry}/", depth + 1)
-
-
-def get_files(camera: gp.Camera, folder: str, suffix: str) -> list:
-    """
-    Recursively retrieves files from a camera folder and its subfolders.
-    Args:
-        camera (gphoto2.Camera): Camera instance used to retrieve files.
-        folder (str): The folder path on the camera to search for files.
-        suffix (str): The file extension to filter files.
-    Returns:
-        list: A list of tuples containing the folder and file name of matching files.
-    """
-    matching_files = []
-    for entry in gp.gp_camera_folder_list_files(camera, folder)[1]:
-        file_entry = entry[0]
-        if file_entry.endswith(suffix):
-            matching_files.append(
-                (
-                    folder,
-                    file_entry,
-                )
-            )
-    for entry in gp.gp_camera_folder_list_folders(camera, folder)[1]:
-        folder_entry = entry[0]
-        matching_files.extend(get_files(camera, f"{folder}{folder_entry}/", suffix))
-    return matching_files
 
 
 def handle_gphoto2_output(
@@ -172,6 +60,7 @@ def handle_gphoto2_output(
         if not output:
             continue
         output = output.strip().decode("utf-8")
+        print(output)
 
         # Check for the capture start message:
         match_capture = re_capture.match(output)
@@ -190,6 +79,9 @@ def handle_gphoto2_output(
         if match_delete_file:
             ts_deleting = time.time()
             picture_file = match_delete_file.group(1)
+            os.environ["NUMBER_OF_CAPTURES"] = str(
+                int(os.environ["NUMBER_OF_CAPTURES"]) + 1
+            )
             logger.info("Handling file %s", picture_file)
             s3_filename = f"{params['project_id']}/{params['flight_id']}/image_{int(time.time())}.JPG"
             logger.info("Writing to %s", s3_filename)
@@ -390,7 +282,6 @@ def capture_loop_gphoto2_cli(
         capture_process.terminate()
         capture_read_thread.join()
 
-
         timeseries_db_controller.stop()
 
         # Complete:
@@ -520,7 +411,7 @@ def capture_loop_test(
             )
 
             # Allow some delay to avoid overwhelming the camera
-            time.sleep(5)
+            time.sleep(2.5)
 
 
 def gen_video_feed():
@@ -552,6 +443,7 @@ def main(bypass_camera: bool = False, debug: bool = False):
         gp.GPhoto2Error: If an unhandled gphoto2 error occurs during camera initialization.
     """
     logger = logging.getLogger(__name__)
+    logger.setLevel(logging.DEBUG if debug else logging.INFO)
 
     # Main state to keep track of the thread state:
     main_state = ThreadState()
@@ -572,6 +464,11 @@ def main(bypass_camera: bool = False, debug: bool = False):
     minio_controller.start()
 
     # Initialize database controller:
+    logger.info(
+        "Initializing database controller on %s:%s",
+        os.environ.get("PG_CLOUD_HOST"),
+        os.environ.get("PG_CLOUD_PORT"),
+    )
     database_controller = DatabaseApi(
         config={
             "pg_host": os.environ.get("PG_CLOUD_HOST"),
@@ -634,6 +531,28 @@ def main(bypass_camera: bool = False, debug: bool = False):
         event_running.clear()
         return jsonify({"message": "Capture operation stopped"}), 200
 
+    @app.route("/pause", methods=["POST"])
+    def pause_capture():
+        """
+        Pause the camera capture operation.
+        """
+        if not event_running.is_set():
+            return jsonify({"message": "Capture operation is not running"}), 400
+
+        event_running.clear()
+        return jsonify({"message": "Capture operation stopped"}), 200
+
+    @app.route("/pause", methods=["POST"])
+    def unpause_capture():
+        """
+        Unpause the camera capture operation.
+        """
+        if not event_running.is_set():
+            return jsonify({"message": "Capture operation is not running"}), 400
+
+        event_running.clear()
+        return jsonify({"message": "Capture operation stopped"}), 200
+
     @app.route("/status", methods=["GET"])
     def status():
         """
@@ -642,6 +561,9 @@ def main(bypass_camera: bool = False, debug: bool = False):
         response = {
             "status": main_state.is_running,
             "message": main_state.message,
+            "project_id": -1,
+            "flight_id": -1,
+            "captures": os.environ["NUMBER_OF_CAPTURES"],
         }
         if event_running.is_set():
             if "PROJECT_ID" in os.environ:
@@ -658,13 +580,7 @@ def main(bypass_camera: bool = False, debug: bool = False):
         )
 
     # Start the Flask app in a separate thread
-    app.run("10.8.0.9", 5000)
-
-    # # Take a picture and download:
-    # if bypass_camera:
-    #     capture_loop_test(logger, timeseries_db_controller, minio_controller)
-    # else:
-    #     capture_loop_camera(logger, camera, timeseries_db_controller, minio_controller)
+    app.run(os.environ.get("APP_IP"), int(os.environ.get("APP_PORT")))
 
 
 if __name__ == "__main__":

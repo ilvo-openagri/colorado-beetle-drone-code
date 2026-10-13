@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenAgri Drone
+After=network.target
+
+[Service]
+WorkingDirectory=/home/jbauwens/Code/openagri_drone
+Environment=PYTHONPATH=src
+ExecStart=/usr/bin/env .venv/bin/python -m main_new
+# --test --images /home/jbauwens/Datasets/3d_23072025/Flight2/
+Restart=on-failure
+RestartSec=5s
+TimeoutSec=30
+StandardOutput=append:/var/log/openagri/drone.log
+StandardError=append:/var/log/openagri/drone.log
+User=jbauwens
+
+
+[Install]
+WantedBy=multi-user.target

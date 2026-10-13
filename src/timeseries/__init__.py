@@ -16,23 +16,23 @@ class TimeseriesDbConnector:
         measurement: str,
         telegraf_ip: str = "",
         telegraf_port: int = 8094,
-        tags: dict = {},
     ):
         self._timeseries_queue = Queue()
         self._telegraf_ip = telegraf_ip
         self._telegraf_port = telegraf_port
         self._measurement = measurement
         self._process = None
-        self._telegraf_tags = []
-        self.set_tags(tags)
 
-    def set_tags(self, tags: dict):
+    @staticmethod
+    def get_tags(tags: dict):
+        telegraf_tags = []
         for tag, value in tags.items():
-            self._telegraf_tags.append(
+            telegraf_tags.append(
                 f"{tag}={value.replace(' ','-')}"
                 if isinstance(value, str)
                 else f"{tag}={value}"
             )
+        return ",".join(telegraf_tags)
 
     def start(self):
         """
@@ -51,7 +51,6 @@ class TimeseriesDbConnector:
             target=self._data_logger,
             args=(
                 self._measurement,
-                ",".join(self._telegraf_tags),
                 self._timeseries_queue,
                 self._telegraf_ip,
                 self._telegraf_port,
@@ -106,7 +105,6 @@ class TimeseriesDbConnector:
     @staticmethod
     def _data_logger(
         measurement: str,
-        tag_set: str,
         queue: Queue,
         telegraf_ip: str = "",
         telegraf_port: int = 8094,
@@ -122,7 +120,6 @@ class TimeseriesDbConnector:
 
         Args:
             measurement (str): The name of the measurement to log.
-            tag_set (str): A string representing the tags to associate with the measurement.
             queue (Queue): A queue containing data samples to be logged. Each sample
                 should be a dictionary of key-value pairs.
             telegraf_ip (str, optional): The IP address of the Telegraf instance. Defaults to an empty string.
@@ -138,6 +135,7 @@ class TimeseriesDbConnector:
             - The socket will always be closed, even in case of an error, ensuring proper resource cleanup.
         """
         logger = logging.getLogger("_data_logger")
+        logger.setLevel(logging.CRITICAL)
         logger.info(f"Connecting to Telegraf at {telegraf_ip}:{telegraf_port}")
         sock = None
         while sock is None:
@@ -162,12 +160,16 @@ class TimeseriesDbConnector:
                             if isinstance(value, str)
                             else f"{key}={value}"
                         )
-                        for key, value in sample.items()
+                        for key, value in sample["fields"].items()
                     ]
                 )
+                tag_set = TimeseriesDbConnector.get_tags(sample["tags"])
                 data = f"{measurement},{tag_set} {field_set} {int(time.time_ns())}\n"
+                start_time = time.time()
                 sock_rc = sock.send(data.encode("utf-8"))
-                logger.info(f"Sent data: {data} [{sock_rc}]")
+                logger.info(
+                    f"Sent data: {data} in {time.time() - start_time} seconds [{sock_rc}]"
+                )
             except KeyboardInterrupt:
                 stop_logging = True
                 logger.info("Keyboard interrupt received, stopping data logger...")

@@ -1,11 +1,71 @@
 """API to perform interactions with the postgresql database in the context of the OpenAgri project"""
 
 import logging
+import os
 import psycopg2
 import psycopg2.extras
-import time
-import threading
 import queue
+import subprocess
+import sys
+import threading
+import time
+
+
+class QueryWriter:
+
+    def __init__(self, query_file):
+        self._logger = logging.getLogger(__name__)
+        self._logger.setLevel(logging.INFO)
+
+        # Ensure file exists
+        self._log_file = query_file
+        os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
+
+        with open(self._log_file, "w") as f:
+            f.write("")
+
+        open(self._log_file, "a").close()
+
+        self._logger.info("Initialized file‑based query logger: %s", query_file)
+
+        # Start database worker as a completely separate process
+        self._logger.info("Starting query writer")
+        self._worker_process = subprocess.Popen(
+            [
+                sys.executable,
+                os.path.join(
+                    os.path.dirname(__file__) + "/../..", "database_worker.py"
+                ),
+                query_file,
+            ],
+            start_new_session=True,
+        )
+
+        self._logger.info(
+            "Started database worker (PID=%s)",
+            self._worker_process.pid,
+        )
+
+    def _write_query(self, query: str):
+        """Write a single query to the log file (one line per query)."""
+        with open(self._log_file, "a") as f:
+            f.write(query.replace("\n", " ").strip() + "\n")
+
+    def post_image(self, image_id, flight_id: int, image: dict) -> int:
+        query = f"""
+            INSERT INTO images (id, flight_id, storage_location, gps_location, width, height)
+            VALUES (
+                {image_id},
+                {flight_id},
+                '{image['storage']}',
+                POINT({image['gps']['latitude']}, {image['gps']['longitude']}),
+                {image['size']['width']},
+                {image['size']['height']}
+            )
+            RETURNING id;
+        """
+        self._write_query(query)
+        return -1
 
 
 class DatabaseApi:
@@ -49,6 +109,11 @@ class DatabaseApi:
             user=self._config["pg_user"],
             password=self._config["pg_password"],
             port=self._config["pg_port"],
+            options="-c statement_timeout=250",
+            keepalives=1,
+            keepalives_idle=5,
+            keepalives_interval=2,
+            keepalives_count=3,
         )
 
     def _execute_query(self, query: str, commit: bool = False) -> list:
@@ -69,15 +134,20 @@ class DatabaseApi:
         max_retries = 2  # First attempt + one retry after reconnect
         attempt = 0
 
-        while attempt < max_retries:
+        while True:
+            self._logger.info("Attempt %d:", attempt)
             attempt += 1
             cursor = None
             try:
+                self._logger.info("Creating cursor")
                 cursor = self._db_connection.cursor(
                     cursor_factory=psycopg2.extras.RealDictCursor
                 )
+                self._logger.info("Executing cursor")
                 cursor.execute(query)
+                self._logger.info("Fetchall")
                 values = cursor.fetchall()
+                self._logger.info("Done")
                 if commit:
                     self._db_connection.commit()
                 return values
@@ -86,6 +156,7 @@ class DatabaseApi:
                 psycopg2.errors.InterfaceError,
                 psycopg2.errors.OperationalError,
             ) as ex:
+                self._logger.error("Operational error")
                 # Connection issues, try to reconnect once
                 if attempt >= max_retries:
                     raise RuntimeError(
@@ -95,6 +166,7 @@ class DatabaseApi:
                 continue  # Retry the query after reconnecting
 
             except psycopg2.errors.UniqueViolation as ex:
+                self._logger.error("Unique error")
                 self._db_connection.rollback()
                 raise RuntimeError("Unique constraint violated") from ex
 
@@ -104,7 +176,7 @@ class DatabaseApi:
             finally:
                 if cursor is not None:
                     cursor.close()
-
+            time.sleep(1)
         raise RuntimeError("Query execution failed after retries")
 
     def _query_worker(self):
@@ -114,13 +186,22 @@ class DatabaseApi:
                 break  # Sentinel to stop the thread
             query, commit, result_queue = item
             try:
+                start_time = time.time()
+                self._logger.info("Executing query")
                 result = self._execute_query(query, commit)
-                self._logger.info(f"Executed query")
+                self._logger.info(
+                    "Executed query %s in %f seconds",
+                    query[:32].strip(),
+                    time.time() - start_time,
+                )
                 if result_queue:
                     result_queue.put(result)
             except Exception as ex:
-                if result_queue:
-                    result_queue.put(ex)
+                self._logger.error(
+                    "Error executing query. Putting it back on the queue"
+                )
+                self._logger.error("Error: %s", ex)
+                self.enqueue_query(query, commit, wait=result_queue is not None)
             finally:
                 self._query_queue.task_done()
 
@@ -168,8 +249,7 @@ class DatabaseApi:
         if "end" in kwargs:
             where += f" AND flight.timestamp_epoch < {kwargs['end']}"
 
-        values = self.enqueue_query(
-            f"""SELECT 
+        values = self.enqueue_query(f"""SELECT 
             project.id as project_id,
             flight.id as flight_id,
             project.*,
@@ -197,8 +277,7 @@ class DatabaseApi:
             ) as beetle_count
             FROM flights flight
             INNER JOIN projects project on project.id = flight.project_id
-            {where}"""
-        )
+            {where}""")
         return values
 
     def post_project(self, name: str) -> int:
@@ -265,16 +344,14 @@ class DatabaseApi:
         Returns:
             List: Image descriptions
         """
-        values = self.enqueue_query(
-            f"""
+        values = self.enqueue_query(f"""
             SELECT image.*, COUNT(detection.*) as detection_count
             FROM images image
             LEFT JOIN detections detection ON detection.image_id = image.id AND detection.confidence > 0.5
             WHERE image.flight_id = {flight_id}
             GROUP BY image.id
             ORDER BY image.id
-            """
-        )
+            """)
         return values
 
     def post_image(self, flight_id: int, image: dict) -> int:
@@ -327,12 +404,10 @@ class DatabaseApi:
         Returns:
             List: Detection descriptions
         """
-        values = self.enqueue_query(
-            f"""
+        values = self.enqueue_query(f"""
             SELECT detection.*
             FROM detections detection
             WHERE detection.image_id = {image_id}
             ORDER BY detection.id
-            """
-        )
+            """)
         return values
