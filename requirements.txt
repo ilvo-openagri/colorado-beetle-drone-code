@@ -1,6 +1,7 @@
 boto3
 crc==5.0.0
 flask
+gevent
 gphoto2
 imageio
 influxdb-client

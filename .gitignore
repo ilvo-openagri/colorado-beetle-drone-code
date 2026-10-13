@@ -6,6 +6,14 @@ __pycache__/
 # C extensions
 *.so
 
+# Images:
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.bmp
+*.tiff
+
 # Distribution / packaging
 bin/
 build/
@@ -49,3 +57,12 @@ coverage.xml
 
 # Sphinx documentation
 docs/_build/
+
+# Local deployment configuration
+.env
+.env.*
+!.env*.example
+
+# Logs
+Logs/
+*.log
