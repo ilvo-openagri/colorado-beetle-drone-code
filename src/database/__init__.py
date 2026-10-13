@@ -12,23 +12,27 @@ import time
 
 
 class QueryWriter:
-
-    def __init__(self, query_file):
+    def __init__(self, query_file, database_config):
         self._logger = logging.getLogger(__name__)
         self._logger.setLevel(logging.INFO)
 
-        # Ensure file exists
         self._log_file = query_file
-        os.makedirs(os.path.dirname(self._log_file), exist_ok=True)
-
-        with open(self._log_file, "w") as f:
-            f.write("")
-
-        open(self._log_file, "a").close()
+        os.makedirs(os.path.dirname(os.path.abspath(self._log_file)), exist_ok=True)
+        open(self._log_file, "w").close()
 
         self._logger.info("Initialized file‑based query logger: %s", query_file)
 
-        # Start database worker as a completely separate process
+        worker_env = os.environ.copy()
+        worker_env.update(
+            {
+                "PG_CLOUD_HOST": str(database_config["PG_CLOUD_HOST"]),
+                "PG_CLOUD_PORT": str(database_config["PG_CLOUD_PORT"]),
+                "PG_CLOUD_DATABASE": str(database_config["PG_CLOUD_DATABASE"]),
+                "PG_CLOUD_USER": str(database_config["PG_CLOUD_USER"]),
+                "PG_CLOUD_PASSWORD": str(database_config["PG_CLOUD_PASSWORD"]),
+            }
+        )
+
         self._logger.info("Starting query writer")
         self._worker_process = subprocess.Popen(
             [
@@ -38,6 +42,7 @@ class QueryWriter:
                 ),
                 query_file,
             ],
+            env=worker_env,
             start_new_session=True,
         )
 

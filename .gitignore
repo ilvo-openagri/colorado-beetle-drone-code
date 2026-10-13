@@ -8,11 +8,17 @@ __pycache__/
 
 # Images:
 *.jpg
+*.JPG
 *.jpeg
+*.JPEG
 *.png
+*.PNG
 *.gif
+*.GIF
 *.bmp
+*.BMP
 *.tiff
+*.TIFF
 
 # Distribution / packaging
 bin/

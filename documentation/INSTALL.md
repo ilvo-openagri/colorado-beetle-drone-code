@@ -119,14 +119,17 @@ Use `"ads": "cloud"` to select the cloud connector.
 
 ## Optional: run with systemd
 
-The repository includes `openagri_drone.service` as a deployment starting
-point. Before installing it, update its working directory, Python executable,
-service user, and log destination for the target machine. Ensure that the
-service user can access the camera and configuration files, and can write to
-the log directory. Then install and enable the unit:
+The repository includes `openagri_drone@.service`, a systemd template that runs
+the service as the named account. It expects the repository checkout and
+`.venv` to be in `~/drone` for that account. Set up the checkout,
+environment files, and camera permissions for the service account first.
+Replace `openagri` below with the account name used on the target machine:
 
 ```sh
-sudo cp openagri_drone.service /etc/systemd/system/openagri_drone.service
+sudo cp openagri_drone@.service /etc/systemd/system/
 sudo systemctl daemon-reload
-sudo systemctl enable --now openagri_drone.service
+sudo systemctl enable --now openagri_drone@openagri.service
 ```
+
+The application and its database worker write logs to the systemd journal. Read
+them with `sudo journalctl -u openagri_drone@openagri.service -f`.

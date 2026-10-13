@@ -72,7 +72,9 @@ class CloudConnector:
                 "pg_password": cloud_config["PG_CLOUD_PASSWORD"],
             }
         )
-        self._database_query_writer = QueryWriter(cloud_config["QUERY_FILE"])
+        self._database_query_writer = QueryWriter(
+            cloud_config["QUERY_FILE"], cloud_config
+        )
 
     def start(self):
         """

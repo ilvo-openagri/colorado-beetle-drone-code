@@ -2,6 +2,7 @@ from pathlib import Path
 import argparse
 import logging
 import multiprocessing as mp
+import os
 import queue
 import socket
 import time
@@ -13,19 +14,7 @@ DB_SOCKET_TIMEOUT_SECONDS = 5
 DB_STATEMENT_TIMEOUT_MS = 5000
 
 
-PG_CLOUD_HOST = "ilvonuc.com"
-PG_CLOUD_DATABASE = "openagri"
-PG_CLOUD_USER = "openagri_user"
-PG_CLOUD_PASSWORD = "QkEaDeYwNZRrirZ"
-PG_CLOUD_PORT = 30002
-
-
-LOG_PATH = Path("/var/log/openagri/database_worker.log")
-if not LOG_PATH.parent.exists():
-    LOG_PATH = Path.cwd() / "database_worker.log"
-
 logging.basicConfig(
-    filename=str(LOG_PATH),
     format="[%(levelname)s %(name)s @ %(asctime)s] %(message)s",
     level=logging.DEBUG,
 )
@@ -35,11 +24,11 @@ logger = logging.getLogger("database-worker")
 
 def connection_kwargs():
     return {
-        "host": PG_CLOUD_HOST,
-        "port": PG_CLOUD_PORT,
-        "database": PG_CLOUD_DATABASE,
-        "user": PG_CLOUD_USER,
-        "password": PG_CLOUD_PASSWORD,
+        "host": os.environ["PG_CLOUD_HOST"],
+        "port": int(os.environ["PG_CLOUD_PORT"]),
+        "database": os.environ["PG_CLOUD_DATABASE"],
+        "user": os.environ["PG_CLOUD_USER"],
+        "password": os.environ["PG_CLOUD_PASSWORD"],
         "connect_timeout": 5,
         "keepalives": 1,
         "keepalives_idle": 5,

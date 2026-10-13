@@ -37,7 +37,6 @@ class TestCamera(_Camera):
         self._logger.info("Capturing images using Test CLI")
 
         for image_file in self._image_files:
-            # image_file = "/home/jbauwens/Datasets/3d_23072025/Flight2/DSC00798.JPG"
             start_time = time.time()
             if not self._event_running.is_set():
                 self._logger.info("Stopping TestCamera loop.")

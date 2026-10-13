@@ -219,25 +219,3 @@ class MinioController:
             int: The number of items in the MinIO queue.
         """
         return self._minio_queue.qsize()
-
-
-def main():
-    import os
-
-    # Example usage
-    minio = MinioController(
-        os.getenv("MINIO_URL", "http://localhost:9000"),
-        os.getenv("MINIO_ACCESS_KEY", "default_access_key"),
-        os.getenv("MINIO_SECRET_KEY", "default_secret_key"),
-    )
-    minio.start()
-    minio.upload_file(
-        "/home/jbauwens/Code/openagri_drone/test_image.JPG",
-        "openagri-raw",
-        "test_image.JPG",
-    )
-    minio.stop()
-
-
-if __name__ == "__main__":
-    main()

@@ -1,0 +1,19 @@
+[Unit]
+Description=OpenAgri Drone
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=%i
+WorkingDirectory=%h/drone
+Environment=PYTHONPATH=%h/drone/src
+Environment=PYTHONUNBUFFERED=1
+ExecStart=%h/drone/.venv/bin/python -m main_new
+Restart=on-failure
+RestartSec=5s
+TimeoutSec=30
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
